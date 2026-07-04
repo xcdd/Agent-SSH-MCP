@@ -33,6 +33,16 @@ function expandPath(input: string | undefined): string | undefined {
 const DEFAULT_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours default timeout
 const CONNECT_TIMEOUT = 30 * 1000; // 30 seconds connection timeout
 
+const INTERACTIVE_PROMPT_RE = /\[Y\/n\]|\[y\/N\]|\(yes\/no\)|\[yes\/no\]|\(y\/n\)|\(Y\/N\)|password\s*:|\bpassphrase\s*:|--More--|continue\s*\?\s*\[|are you sure|do you want to|\(y or n\)|\(yes or no\)|enter .{0,30}:/i;
+
+function cleanPaneOutput(s: string): string {
+  return s
+    .replace(/\r/g, '')
+    .replace(/\x1b\[\?[0-9]+[hl]/g, '')
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/\s+$/, '');
+}
+
 const HOSTS_DIR = resolvePath(os.homedir(), '.ssh-mcp');
 const HOSTS_FILE = resolvePath(HOSTS_DIR, 'hosts.json');
 
@@ -472,7 +482,7 @@ server.tool(
 
 server.tool(
   "exec",
-  "Execute a shell command on an existing SSH session. When tmux is active, commands are automatically sent via tmux (non-blocking, user can observe with 'tmux attach -t ai'). IMPORTANT: Just pass the actual command to execute — do NOT manually write 'tmux send-keys' or 'tmux capture-pane', the plugin handles tmux routing automatically. If tmux session is lost, automatically falls back to direct shell mode.",
+  "Execute a shell command on an existing SSH session. When tmux is active, commands are automatically sent via tmux (non-blocking, user can observe with 'tmux attach -t ai'). IMPORTANT: Just pass the actual command to execute — do NOT manually write 'tmux send-keys' or 'tmux capture-pane', the plugin handles tmux routing automatically. If tmux session is lost, automatically falls back to direct shell mode. INTERACTIVE COMMANDS: When the output contains '[Command is waiting for input...]', call exec again with just the raw response (e.g. 'y', 'n', a password) — the plugin will route it as raw keystrokes to the waiting prompt, NOT as a new wrapped command.",
   {
     session_id: z.string().describe("Identifier of the session to use"),
     command: z.string().describe("Command to execute"),
@@ -713,6 +723,10 @@ class PersistentSession {
   private tmuxReady = false;
   private tmuxSessionName = 'ai';
   private sftp: SFTPWrapper | null = null;
+  // When a tmux command returns exitCode -2 (waiting for input), these fields persist
+  // across the exec call boundary so the next exec sends raw input instead of a wrapped command.
+  private tmuxPendingMarkers: { startMarker: string; endMarker: string } | null = null;
+  private tmuxWaitingForInput = false;
 
   constructor(
     private readonly id: string,
@@ -930,9 +944,14 @@ class PersistentSession {
 
       if (this.tmuxReady) {
         try {
+          if (this.tmuxWaitingForInput && this.tmuxPendingMarkers) {
+            return await this.executeInteractiveInput(command);
+          }
           return await this.executeViaTmux(command);
         } catch (err) {
           this.tmuxReady = false;
+          this.tmuxWaitingForInput = false;
+          this.tmuxPendingMarkers = null;
           console.error(`SSH session ${this.id}: tmux execution failed, falling back to direct shell:`, err);
           return this.executeDirect(command);
         }
@@ -1061,7 +1080,6 @@ class PersistentSession {
   }
 
   private async executeViaTmux(command: string): Promise<{ output: string; exitCode: number }> {
-    // Detect heredoc — it causes tmux to hang waiting for EOF input
     if (/<<\s*'?[A-Za-z_][A-Za-z0-9_]*'?/.test(command)) {
       return {
         output: '[ERROR] heredoc syntax (<<EOF) causes tmux sessions to hang. Use the write-remote-file tool to write file contents instead.',
@@ -1071,19 +1089,12 @@ class PersistentSession {
 
     this.lastCommand = command;
     this.resetInactivityTimer();
-
-    // Clear tmux scrollback so capture-pane only sees output from this command
     await this.executeDirect(`tmux clear-history -t ${this.tmuxSessionName} 2>/dev/null`);
 
     const token = randomUUID();
     const startMarker = `__MCP_START__${token}__`;
     const endMarker = `__MCP_DONE__${token}__`;
 
-    // Send compound command with start and end markers to tmux
-    // In tmux shell: echo __MCP_START__; <cmd>; echo __MCP_DONE__$?
-    // The $? after the command captures the command's exit code
-    // Use single quotes for send-keys to avoid SSH shell expansion
-    // Escape single quotes in the command using '\'' pattern
     const escapedCmd = command.replace(/'/g, "'\\''");
     const sendCmd = `echo ${startMarker}; ${escapedCmd}; echo ${endMarker}$?`;
     const sendResult = await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName} '${sendCmd}' Enter`);
@@ -1091,86 +1102,117 @@ class PersistentSession {
       throw new Error(`tmux send-keys failed: ${sendResult.output}`);
     }
 
-    // Poll tmux capture-pane until end marker appears
-    const maxWaitMs = 30000;
+    // Persist markers so executeInteractiveInput can continue polling if we return -2
+    this.tmuxPendingMarkers = { startMarker, endMarker };
+
+    const result = await this.pollForCompletion(startMarker, endMarker, 30000);
+    if (result.exitCode === -2) {
+      this.tmuxWaitingForInput = true;
+    } else {
+      this.tmuxPendingMarkers = null;
+    }
+    return result;
+  }
+
+  // Shared poll loop used by both executeViaTmux and executeInteractiveInput.
+  // Returns exitCode -2 if an interactive prompt is detected (waiting for input),
+  // exitCode -1 on timeout, or the real exit code on completion.
+  private async pollForCompletion(
+    startMarker: string,
+    endMarker: string,
+    maxWaitMs: number,
+  ): Promise<{ output: string; exitCode: number }> {
     const pollIntervalMs = 300;
+    const STABLE_THRESHOLD = 4;
     const startTime = Date.now();
     let pollCount = 0;
-    // For interactive-prompt detection
-    let lastAfterStart = '';
+    let lastTail = '';
     let stablePollCount = 0;
-    const STABLE_THRESHOLD = 4; // ~1.2s stable → likely waiting for input
-    const INTERACTIVE_PROMPT_RE = /\[Y\/n\]|\[y\/N\]|\(yes\/no\)|\[yes\/no\]|\(y\/n\)|\(Y\/N\)|password\s*:|\bpassphrase\s*:|--More--|continue\s*\?\s*\[|are you sure|do you want to|\(y or n\)|\(yes or no\)|enter .{0,30}:/i;
-    const startMarkerLineRegex = new RegExp(`\\n${escapeRegex(startMarker)}\\n`);
-    const endMarkerLineRegex = new RegExp(`${escapeRegex(endMarker)}(\\d+)(?:\\n|$)`, 'm');
-
-    const cleanOutput = (s: string) => s
-      .replace(/\r/g, '')
-      .replace(/\x1b\[\?[0-9]+[hl]/g, '')
-      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-      .replace(/\s+$/, '');
+    const startMarkerRe = new RegExp(`\\n${escapeRegex(startMarker)}\\n`);
+    const endMarkerRe = new RegExp(`${escapeRegex(endMarker)}(\\d+)(?:\\n|$)`, 'm');
 
     while (Date.now() - startTime < maxWaitMs) {
       await new Promise(r => setTimeout(r, pollIntervalMs));
       pollCount++;
 
       const capResult = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName} -p -S -200 2>&1`);
-      if (capResult.exitCode !== 0 && pollCount <= 3) {
-        continue;
-      }
-      if (capResult.exitCode !== 0) {
-        throw new Error(`tmux capture-pane failed: ${capResult.output}`);
-      }
+      if (capResult.exitCode !== 0 && pollCount <= 3) continue;
+      if (capResult.exitCode !== 0) throw new Error(`tmux capture-pane failed: ${capResult.output}`);
 
       const pane = capResult.output;
 
-      // Check for end marker first
-      const endMatch = pane.match(endMarkerLineRegex);
+      // End marker → command finished
+      const endMatch = pane.match(endMarkerRe);
       if (endMatch) {
         const exitCode = parseInt(endMatch[1], 10);
-        const endMarkerLineStart = endMatch.index!;
-
-        const startMatch = pane.match(startMarkerLineRegex);
+        const endMarkerStart = endMatch.index!;
+        const startMatch = pane.match(startMarkerRe);
         let cmdOutput: string;
         if (startMatch) {
-          const startMarkerLineEnd = startMatch.index! + 1 + startMatch[0].length - 1;
-          cmdOutput = pane.slice(startMarkerLineEnd, endMarkerLineStart);
+          const afterStartMarker = startMatch.index! + 1 + startMatch[0].length - 1;
+          cmdOutput = pane.slice(afterStartMarker, endMarkerStart);
         } else {
-          cmdOutput = pane.slice(0, endMarkerLineStart);
+          cmdOutput = pane.slice(0, endMarkerStart);
         }
-
-        return { output: cleanOutput(cmdOutput), exitCode: Number.isNaN(exitCode) ? 0 : exitCode };
+        this.tmuxPendingMarkers = null;
+        this.tmuxWaitingForInput = false;
+        return { output: cleanPaneOutput(cmdOutput), exitCode: Number.isNaN(exitCode) ? 0 : exitCode };
       }
 
-      // Interactive-prompt detection: only after start marker has appeared
-      const startMatch = pane.match(startMarkerLineRegex);
-      if (startMatch) {
-        const afterStart = pane.slice(startMatch.index! + 1 + startMatch[0].length - 1);
-        const afterStartTrimmed = afterStart.trim();
+      // Prompt detection: skip first 2 polls to let command start
+      if (pollCount < 2) continue;
 
-        if (afterStartTrimmed) {
-          // Immediate: known interactive prompt pattern
-          if (INTERACTIVE_PROMPT_RE.test(afterStartTrimmed)) {
-            return { output: cleanOutput(afterStart), exitCode: -2 };
-          }
+      // Check region after start marker if visible, otherwise the full pane
+      const startMatch = pane.match(startMarkerRe);
+      const region = startMatch
+        ? pane.slice(startMatch.index! + 1 + startMatch[0].length - 1)
+        : pane;
+      const regionTrimmed = region.trim();
 
-          // Stability: content unchanged for STABLE_THRESHOLD polls
-          if (afterStartTrimmed === lastAfterStart) {
-            stablePollCount++;
-            if (stablePollCount >= STABLE_THRESHOLD) {
-              return { output: cleanOutput(afterStart), exitCode: -2 };
-            }
-          } else {
-            stablePollCount = 0;
-            lastAfterStart = afterStartTrimmed;
+      if (regionTrimmed) {
+        // Pattern: immediately recognisable interactive prompt
+        if (INTERACTIVE_PROMPT_RE.test(regionTrimmed)) {
+          return { output: cleanPaneOutput(region), exitCode: -2 };
+        }
+        // Stability: last few lines unchanged for STABLE_THRESHOLD polls
+        const tail = cleanPaneOutput(region).split('\n').filter(l => l.trim()).slice(-5).join('\n');
+        if (tail && tail === lastTail) {
+          stablePollCount++;
+          if (stablePollCount >= STABLE_THRESHOLD) {
+            return { output: cleanPaneOutput(region), exitCode: -2 };
           }
+        } else {
+          stablePollCount = 0;
+          lastTail = tail;
         }
       }
     }
 
-    // Timeout: return whatever we have
-    const { output: pane } = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName} -p -S -200 2>&1`);
-    return { output: cleanOutput(pane), exitCode: -1 };
+    const { output: finalPane } = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName} -p -S -200 2>&1`);
+    return { output: cleanPaneOutput(finalPane), exitCode: -1 };
+  }
+
+  // Called instead of executeViaTmux when the session is in tmuxWaitingForInput state.
+  // Sends raw keystrokes (no marker wrapping) and resumes polling for the original end marker.
+  private async executeInteractiveInput(input: string): Promise<{ output: string; exitCode: number }> {
+    this.tmuxWaitingForInput = false;
+    const { startMarker, endMarker } = this.tmuxPendingMarkers!;
+
+    this.lastCommand = input;
+    this.resetInactivityTimer();
+
+    // Send raw input — just the keystrokes, no echo/marker wrapping
+    const escapedInput = input.replace(/'/g, "'\\''");
+    const sendResult = await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName} '${escapedInput}' Enter`);
+    if (sendResult.exitCode !== 0) {
+      throw new Error(`tmux send-keys failed: ${sendResult.output}`);
+    }
+
+    const result = await this.pollForCompletion(startMarker, endMarker, 30000);
+    if (result.exitCode === -2) {
+      this.tmuxWaitingForInput = true;
+    }
+    return result;
   }
 
   forwardPort(localPort: number, remoteHost: string, remotePort: number): Promise<net.Server> {
