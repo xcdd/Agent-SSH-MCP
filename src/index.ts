@@ -445,7 +445,7 @@ server.tool(
 
 server.tool(
   "start-session",
-  "Start a new SSH session for a stored host. Automatically initializes tmux if available (user can attach with 'tmux attach -t ai'). Falls back to direct shell if tmux is not installed. IMPORTANT: Commands that install tmux itself should be executed BEFORE calling start-session, or use setup-tmux after installation. When tmux is active, the exec tool automatically routes commands through tmux — just pass the actual command, do NOT manually write 'tmux send-keys'.",
+  "Start a new SSH session for a stored host. Automatically initializes tmux if available (user can attach with the tmux session name returned in the response). Falls back to direct shell if tmux is not installed. IMPORTANT: Commands that install tmux itself should be executed BEFORE calling start-session, or use setup-tmux after installation. When tmux is active, the exec tool automatically routes commands through tmux — just pass the actual command, do NOT manually write 'tmux send-keys'.",
   {
     host_id: z.string().describe("Identifier of the host to connect"),
     sessionId: z.string().optional().describe("Optional session identifier; generated if omitted"),
@@ -475,7 +475,9 @@ server.tool(
       console.error(`start-session: tmux init failed for ${id}:`, err);
     }
     const info = session.getInfo();
-    const tmuxStatus = info.tmuxReady ? 'tmux ready (attach: tmux attach -t ai)' : 'tmux not available (direct shell mode)';
+    const tmuxStatus = info.tmuxReady
+      ? `tmux ready (attach: tmux attach -t ${info.tmuxSessionName})`
+      : 'tmux not available (direct shell mode)';
     return { content: [{ type: 'text', text: `${id}\n${tmuxStatus}` }] };
   }
 );
@@ -591,7 +593,7 @@ server.tool(
 
 server.tool(
   "setup-tmux",
-  "Initialize tmux session on an existing SSH session. Use this after installing tmux on the remote server to switch from direct shell mode to tmux mode. When tmux is active, user can 'tmux attach -t ai' to observe commands in real-time.",
+  "Initialize tmux session on an existing SSH session. Use this after installing tmux on the remote server to switch from direct shell mode to tmux mode. When tmux is active, user can attach with the session name returned by start-session to observe commands in real-time.",
   {
     session_id: z.string().describe("Identifier of the session to initialize tmux on"),
   },
@@ -721,7 +723,7 @@ class PersistentSession {
   private lastCommand: string | null = null;
   private connected = false;
   private tmuxReady = false;
-  private tmuxSessionName = 'ai';
+  private readonly tmuxSessionName: string;
   private sftp: SFTPWrapper | null = null;
   // When a tmux command returns exitCode -2 (waiting for input), these fields persist
   // across the exec call boundary so the next exec sends raw input instead of a wrapped command.
@@ -735,7 +737,11 @@ class PersistentSession {
     private readonly onDispose?: (id: string) => void,
     private readonly proxyUrl?: string,
     private readonly noProxy?: boolean,
-  ) {}
+  ) {
+    // Derive a tmux-safe session name from the SSH session ID so multiple sessions
+    // to the same server don't share and clobber each other's tmux session.
+    this.tmuxSessionName = this.id.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 50);
+  }
 
   getInfo() {
     return {
@@ -747,6 +753,7 @@ class PersistentSession {
       lastCommand: this.lastCommand,
       disposed: this.disposed,
       tmuxReady: this.tmuxReady,
+      tmuxSessionName: this.tmuxSessionName,
     };
   }
 
