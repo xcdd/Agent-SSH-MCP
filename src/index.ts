@@ -13,6 +13,10 @@ import { resolve as resolvePath, dirname } from 'path';
 import os from 'os';
 import net from 'net';
 import { randomUUID } from 'crypto';
+import { execFile as execFileCb } from 'child_process';
+import { promisify } from 'util';
+
+const execFile = promisify(execFileCb);
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -32,6 +36,188 @@ const CONNECT_TIMEOUT = 30 * 1000; // 30 seconds connection timeout
 const HOSTS_DIR = resolvePath(os.homedir(), '.ssh-mcp');
 const HOSTS_FILE = resolvePath(HOSTS_DIR, 'hosts.json');
 
+// ── Proxy detection ────────────────────────────────────────────────────────
+
+let _cachedSystemProxy: string | null | undefined = undefined; // undefined = not checked yet
+
+async function getSystemProxy(): Promise<string | null> {
+  if (_cachedSystemProxy !== undefined) return _cachedSystemProxy;
+
+  // 1. Standard environment variables (all platforms)
+  const fromEnv = process.env.ALL_PROXY ?? process.env.all_proxy ??
+    process.env.HTTPS_PROXY ?? process.env.https_proxy ??
+    process.env.HTTP_PROXY ?? process.env.http_proxy ?? null;
+  if (fromEnv) { _cachedSystemProxy = fromEnv; return fromEnv; }
+
+  // 2. Platform-specific
+  try {
+    if (process.platform === 'win32') {
+      _cachedSystemProxy = await getWindowsSystemProxy();
+    } else if (process.platform === 'darwin') {
+      _cachedSystemProxy = await getMacSystemProxy();
+    } else {
+      _cachedSystemProxy = null;
+    }
+  } catch {
+    _cachedSystemProxy = null;
+  }
+  return _cachedSystemProxy;
+}
+
+async function getWindowsSystemProxy(): Promise<string | null> {
+  try {
+    const enableResult = await execFile('reg', [
+      'query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
+      '/v', 'ProxyEnable',
+    ]);
+    if (!enableResult.stdout.includes('0x1')) return null;
+
+    const serverResult = await execFile('reg', [
+      'query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',
+      '/v', 'ProxyServer',
+    ]);
+    const match = serverResult.stdout.match(/ProxyServer\s+REG_SZ\s+(\S+)/);
+    if (!match) return null;
+    const raw = match[1].trim();
+    // "host:port" or "http=h:p;https=h:p;..."
+    const part = raw.includes('=') ? (raw.match(/(?:https?=)([^;]+)/)?.[1] ?? raw.split(';')[0]) : raw;
+    return part.includes('://') ? part : `http://${part}`;
+  } catch {
+    return null;
+  }
+}
+
+async function getMacSystemProxy(): Promise<string | null> {
+  try {
+    const { stdout } = await execFile('scutil', ['--proxy']);
+    const socksEnabled = /SOCKSEnable\s*:\s*1/.test(stdout);
+    if (socksEnabled) {
+      const h = stdout.match(/SOCKSProxy\s*:\s*(\S+)/)?.[1];
+      const p = stdout.match(/SOCKSPort\s*:\s*(\d+)/)?.[1];
+      if (h && p) return `socks5://${h}:${p}`;
+    }
+    const httpEnabled = /HTTPEnable\s*:\s*1/.test(stdout);
+    if (httpEnabled) {
+      const h = stdout.match(/HTTPProxy\s*:\s*(\S+)/)?.[1];
+      const p = stdout.match(/HTTPPort\s*:\s*(\d+)/)?.[1];
+      if (h && p) return `http://${h}:${p}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Proxy socket creation ──────────────────────────────────────────────────
+
+const PROXY_TIMEOUT = 15 * 1000;
+
+async function createProxySocket(proxyUrl: string, targetHost: string, targetPort: number): Promise<net.Socket> {
+  const normalized = proxyUrl.includes('://') ? proxyUrl : `http://${proxyUrl}`;
+  const parsed = new URL(normalized);
+  const scheme = parsed.protocol.replace(':', '');
+  const proxyHost = parsed.hostname;
+  const proxyPort = parseInt(parsed.port) || (scheme === 'socks5' || scheme === 'socks4' || scheme === 'socks' ? 1080 : 3128);
+
+  if (scheme === 'socks5' || scheme === 'socks') {
+    return connectViaSocks5(proxyHost, proxyPort, targetHost, targetPort);
+  }
+  if (scheme === 'socks4') {
+    return connectViaSocks4(proxyHost, proxyPort, targetHost, targetPort);
+  }
+  return connectViaHttpConnect(proxyHost, proxyPort, targetHost, targetPort);
+}
+
+function connectViaHttpConnect(proxyHost: string, proxyPort: number, targetHost: string, targetPort: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: proxyHost, port: proxyPort });
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error(`HTTP proxy ${proxyHost}:${proxyPort} connection timed out`)); }, PROXY_TIMEOUT);
+
+    socket.once('connect', () => {
+      socket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nProxy-Connection: Keep-Alive\r\n\r\n`);
+      let buf = '';
+      const onData = (chunk: Buffer) => {
+        buf += chunk.toString('binary');
+        if (!buf.includes('\r\n\r\n')) return;
+        socket.removeListener('data', onData);
+        clearTimeout(timer);
+        const statusLine = buf.split('\r\n')[0];
+        const code = parseInt(statusLine.split(' ')[1] ?? '0');
+        if (code === 200) { resolve(socket); }
+        else { socket.destroy(); reject(new Error(`HTTP proxy rejected CONNECT to ${targetHost}:${targetPort}: ${statusLine}`)); }
+      };
+      socket.on('data', onData);
+    });
+    socket.once('error', (err) => { clearTimeout(timer); reject(new Error(`HTTP proxy ${proxyHost}:${proxyPort} error: ${err.message}`)); });
+  });
+}
+
+function connectViaSocks5(proxyHost: string, proxyPort: number, targetHost: string, targetPort: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: proxyHost, port: proxyPort });
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error(`SOCKS5 proxy ${proxyHost}:${proxyPort} timed out`)); }, PROXY_TIMEOUT);
+    let step = 0;
+    let partial = Buffer.alloc(0);
+
+    socket.once('connect', () => { socket.write(Buffer.from([0x05, 0x01, 0x00])); });
+    socket.on('data', (chunk: Buffer) => {
+      partial = Buffer.concat([partial, chunk]);
+      if (step === 0 && partial.length >= 2) {
+        if (partial[0] !== 0x05 || partial[1] !== 0x00) {
+          clearTimeout(timer); socket.destroy();
+          reject(new Error(`SOCKS5 auth failed (server chose method 0x${partial[1]?.toString(16) ?? '??'})`));
+          return;
+        }
+        partial = partial.slice(2);
+        step = 1;
+        const hBuf = Buffer.from(targetHost);
+        const req = Buffer.allocUnsafe(7 + hBuf.length);
+        req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
+        req[4] = hBuf.length; hBuf.copy(req, 5);
+        req.writeUInt16BE(targetPort, 5 + hBuf.length);
+        socket.write(req);
+      } else if (step === 1 && partial.length >= 4) {
+        clearTimeout(timer);
+        socket.removeAllListeners('data');
+        if (partial[1] !== 0x00) {
+          socket.destroy();
+          const codes: Record<number, string> = { 1:'general failure', 2:'not allowed', 3:'network unreachable', 4:'host unreachable', 5:'connection refused', 6:'TTL expired' };
+          reject(new Error(`SOCKS5 tunnel to ${targetHost}:${targetPort} failed: ${codes[partial[1]] ?? `code 0x${partial[1].toString(16)}`}`));
+          return;
+        }
+        resolve(socket);
+      }
+    });
+    socket.once('error', (err) => { clearTimeout(timer); reject(new Error(`SOCKS5 proxy ${proxyHost}:${proxyPort} error: ${err.message}`)); });
+  });
+}
+
+function connectViaSocks4(proxyHost: string, proxyPort: number, targetHost: string, targetPort: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: proxyHost, port: proxyPort });
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error(`SOCKS4 proxy ${proxyHost}:${proxyPort} timed out`)); }, PROXY_TIMEOUT);
+    // SOCKS4a: send 0x04 0x01 + port + 0.0.0.1 + nullbyte + hostname + nullbyte
+    socket.once('connect', () => {
+      const hBuf = Buffer.from(targetHost);
+      const req = Buffer.allocUnsafe(9 + hBuf.length + 1);
+      req[0] = 0x04; req[1] = 0x01;
+      req.writeUInt16BE(targetPort, 2);
+      req.writeUInt32BE(1, 4); // 0.0.0.1 for SOCKS4a
+      req[8] = 0x00; // null user id
+      hBuf.copy(req, 9);
+      req[9 + hBuf.length] = 0x00;
+      socket.write(req);
+    });
+    socket.once('data', (chunk: Buffer) => {
+      clearTimeout(timer);
+      socket.removeAllListeners('data');
+      if (chunk[1] === 0x5a) { resolve(socket); }
+      else { socket.destroy(); reject(new Error(`SOCKS4 tunnel to ${targetHost}:${targetPort} failed: code 0x${chunk[1]?.toString(16) ?? '??'}`)); }
+    });
+    socket.once('error', (err) => { clearTimeout(timer); reject(new Error(`SOCKS4 proxy ${proxyHost}:${proxyPort} error: ${err.message}`)); });
+  });
+}
+
 type StoredHost = {
   id: string;
   host: string;
@@ -39,6 +225,8 @@ type StoredHost = {
   username: string;
   password?: string;
   keyPath?: string;
+  proxy?: string;    // e.g. "socks5://127.0.0.1:1080" or "http://proxy:3128"
+  noProxy?: boolean; // disable auto system-proxy detection for this host
 };
 
 const HostsSchema = z.object({
@@ -49,6 +237,8 @@ const HostsSchema = z.object({
     username: z.string(),
     password: z.string().optional(),
     keyPath: z.string().optional(),
+    proxy: z.string().optional(),
+    noProxy: z.boolean().optional(),
   })).default([]),
 });
 
@@ -85,7 +275,7 @@ async function writeHosts(hosts: StoredHost[]): Promise<void> {
   await writeFile(HOSTS_FILE, JSON.stringify({ hosts }, null, 2), 'utf8');
 }
 
-async function getHostConfig(hostId: string): Promise<ConnectConfig> {
+async function getHostConfig(hostId: string): Promise<{ config: ConnectConfig; proxy?: string; noProxy?: boolean }> {
   const hosts = await readHosts();
   const host = hosts.find((h) => h.id === hostId);
   if (!host) {
@@ -108,14 +298,13 @@ async function getHostConfig(hostId: string): Promise<ConnectConfig> {
     const keyContent = await readFile(expanded, 'utf8');
     config.privateKey = keyContent;
   } else {
-    // Fallback to SSH agent if available
     if (process.env.SSH_AUTH_SOCK) {
       config.agent = process.env.SSH_AUTH_SOCK;
       config.agentForward = true;
     }
   }
 
-  return config;
+  return { config, proxy: host.proxy, noProxy: host.noProxy };
 }
 
 // Command sanitization and validation
@@ -166,20 +355,15 @@ server.tool(
     username: z.string().describe("SSH username"),
     password: z.string().optional().describe("Password for authentication"),
     keyPath: z.string().optional().describe("Path to private key (defaults to SSH agent if omitted)"),
+    proxy: z.string().optional().describe("Proxy URL override, e.g. socks5://127.0.0.1:1080 or http://proxy:3128. Omit to use system proxy auto-detection."),
+    noProxy: z.boolean().optional().describe("Set true to disable system proxy auto-detection for this host"),
   },
-  async ({ host_id, host, port, username, password, keyPath }) => {
+  async ({ host_id, host, port, username, password, keyPath, proxy, noProxy }) => {
     const hosts = await readHosts();
     if (hosts.some((h) => h.id === host_id)) {
       throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' already exists`);
     }
-    hosts.push({
-      id: host_id,
-      host,
-      port,
-      username,
-      password,
-      keyPath,
-    });
+    hosts.push({ id: host_id, host, port, username, password, keyPath, proxy, noProxy });
     await writeHosts(hosts);
     return { content: [{ type: 'text', text: `Host '${host_id}' added` }] };
   }
@@ -228,8 +412,10 @@ server.tool(
     username: z.string().optional(),
     password: z.string().optional(),
     keyPath: z.string().optional(),
+    proxy: z.string().optional().describe("Proxy URL override, e.g. socks5://127.0.0.1:1080 or http://proxy:3128"),
+    noProxy: z.boolean().optional().describe("Set true to disable auto system-proxy for this host"),
   },
-  async ({ host_id, host, port, username, password, keyPath }) => {
+  async ({ host_id, host, port, username, password, keyPath, proxy, noProxy }) => {
     const hosts = await readHosts();
     const target = hosts.find((h) => h.id === host_id);
     if (!target) {
@@ -240,6 +426,8 @@ server.tool(
     if (username) target.username = username;
     if (password !== undefined) target.password = password;
     if (keyPath !== undefined) target.keyPath = keyPath;
+    if (proxy !== undefined) target.proxy = proxy;
+    if (noProxy !== undefined) target.noProxy = noProxy;
     await writeHosts(hosts);
     return { content: [{ type: 'text', text: `Host '${host_id}' updated` }] };
   }
@@ -253,14 +441,14 @@ server.tool(
     sessionId: z.string().optional().describe("Optional session identifier; generated if omitted"),
   },
   async ({ host_id, sessionId }) => {
-    const hostConfig = await getHostConfig(host_id);
+    const { config: hostConfig, proxy, noProxy } = await getHostConfig(host_id);
     const id = sessionId && sessionId.trim() ? sessionId.trim() : randomUUID();
     if (activeSessions.has(id)) {
       throw new McpError(ErrorCode.InvalidParams, `Session '${id}' already exists`);
     }
     let session: PersistentSession;
     try {
-      session = await getOrCreateSession(id, hostConfig, true);
+      session = await getOrCreateSession(id, hostConfig, true, proxy, noProxy);
     } catch (err: any) {
       // Connection failed — remove the zombie session from activeSessions
       const zombie = activeSessions.get(id);
@@ -474,8 +662,8 @@ server.tool(
 );
 
 export async function execSshCommand(hostId: string, command: string, sessionId = 'legacy') {
-  const config = await getHostConfig(hostId);
-  const session = await getOrCreateSession(sessionId, config);
+  const { config, proxy, noProxy } = await getHostConfig(hostId);
+  const session = await getOrCreateSession(sessionId, config, false, proxy, noProxy);
   const { output, exitCode } = await session.execute(command);
   if (exitCode !== 0) {
     throw new McpError(ErrorCode.InternalError, `Error (code ${exitCode}):\n${output}`);
@@ -485,7 +673,7 @@ export async function execSshCommand(hostId: string, command: string, sessionId 
   };
 }
 
-async function getOrCreateSession(id: string, config: ConnectConfig, forceNew = false): Promise<PersistentSession> {
+async function getOrCreateSession(id: string, config: ConnectConfig, forceNew = false, proxyUrl?: string, noProxy?: boolean): Promise<PersistentSession> {
   let session = activeSessions.get(id);
   if (session && forceNew) {
     session.dispose();
@@ -498,7 +686,7 @@ async function getOrCreateSession(id: string, config: ConnectConfig, forceNew = 
       if (activeSessions.get(disposedId) === session) {
         activeSessions.delete(disposedId);
       }
-    });
+    }, proxyUrl, noProxy);
     activeSessions.set(id, session);
   }
 
@@ -529,6 +717,8 @@ class PersistentSession {
     private readonly config: ConnectConfig,
     private readonly timeoutMs = DEFAULT_SESSION_TTL_MS,
     private readonly onDispose?: (id: string) => void,
+    private readonly proxyUrl?: string,
+    private readonly noProxy?: boolean,
   ) {}
 
   getInfo() {
@@ -555,6 +745,19 @@ class PersistentSession {
     // Auto-reconnect: if connection was lost but session not disposed, reconnect
     this.cleanup();
     this.connected = false;
+
+    // Resolve proxy socket before opening SSH connection
+    let proxySocket: net.Socket | undefined;
+    const effectiveProxy = this.proxyUrl ?? (this.noProxy ? undefined : await getSystemProxy());
+    if (effectiveProxy) {
+      const targetHost = this.config.host!;
+      const targetPort = this.config.port ?? 22;
+      try {
+        proxySocket = await createProxySocket(effectiveProxy, targetHost, targetPort);
+      } catch (err: any) {
+        throw new Error(`Proxy error (${effectiveProxy} → ${targetHost}:${targetPort}): ${err.message}`);
+      }
+    }
 
     await new Promise<void>((resolve, reject) => {
       const conn = new SSHClient();
@@ -640,9 +843,10 @@ class PersistentSession {
       // Add keepalive to prevent idle connection drops
       const keepaliveConfig: ConnectConfig = {
         ...this.config,
-        keepaliveInterval: 30000,    // Send keepalive every 30s
-        keepaliveCountMax: 5,        // Allow 5 missed keepalives before disconnect
+        keepaliveInterval: 30000,
+        keepaliveCountMax: 5,
       };
+      if (proxySocket) keepaliveConfig.sock = proxySocket;
       conn.connect(keepaliveConfig);
     });
 
