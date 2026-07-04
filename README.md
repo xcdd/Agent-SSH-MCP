@@ -8,14 +8,14 @@ Based on [ssh-mcp-sessions](https://github.com/fryjustinc/ssh-mcp-sessions) by J
 
 ## What's improved over the original
 
-| Issue | Fix |
-|-------|-----|
-| tmux scrollback buffer pollution | `clear-history` before each command + reduced capture window |
-| End marker regex fails on output without trailing newline | Regex no longer requires a preceding `\n` |
-| heredoc (`<< EOF`) hangs the session indefinitely | Detected and rejected with a helpful error message |
-| exit code `-1` indistinguishable from real failure | Timeout case now returns a distinct `[tmux capture timed out]` message |
-| No way to access remote services locally | New `forward-port` / `stop-forward` tools via ssh2 `forwardOut` |
-| Writing files via shell is fragile | New `write-remote-file` tool writes via SFTP — no shell quoting issues |
+| Issue | Root cause | Fix |
+|-------|-----------|-----|
+| Command output contained the entire pane history | End marker regex required a preceding `\n`; commands whose output has no trailing newline caused the marker to be missed → 30 s timeout → full pane returned as fallback | Regex changed to `endMarker(\d+)(?:\n|$)` — no longer depends on a preceding newline |
+| Long sessions accumulated large scrollback, slowing capture | `capture-pane -S -1000` scanned 1000 lines of history on every poll | `tmux clear-history` before each command + reduced window to `-S -200` |
+| heredoc (`<< EOF`) hung the session indefinitely | tmux waits for EOF input that never arrives via `send-keys` | Detected and rejected immediately with a helpful error; use `write-remote-file` instead |
+| exit code `-1` was indistinguishable from a real non-zero exit | Timeout and true failure both returned the same code | Timeout now returns `[tmux capture timed out — command may still be running]` |
+| No way to access remote services (e.g. PostgreSQL) locally | No port-forwarding tool existed | New `forward-port` / `stop-forward` tools using ssh2 `forwardOut` |
+| Writing files via shell was fragile (quoting, special chars, heredoc) | Shell-based writes require careful escaping and break with special characters | New `write-remote-file` tool writes directly via SFTP — no shell involved |
 
 ---
 
