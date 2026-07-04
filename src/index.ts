@@ -915,10 +915,10 @@ class PersistentSession {
       throw new Error(`Failed to create tmux session '${this.tmuxSessionName}': ${createResult.output}`);
     }
 
-    await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName} 'stty echo' Enter`);
-    await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName} "export PS1='root@${host} # '" Enter`);
+    await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName}:0.0 'stty echo' Enter`);
+    await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName}:0.0 "export PS1='root@${host} # '" Enter`);
     // Clear screen so init commands don't pollute capture-pane output
-    await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName} 'clear' Enter`);
+    await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName}:0.0 'clear' Enter`);
 
     // Small delay to let tmux shell initialize
     await new Promise(r => setTimeout(r, 500));
@@ -1089,7 +1089,7 @@ class PersistentSession {
 
     this.lastCommand = command;
     this.resetInactivityTimer();
-    await this.executeDirect(`tmux clear-history -t ${this.tmuxSessionName} 2>/dev/null`);
+    await this.executeDirect(`tmux clear-history -t ${this.tmuxSessionName}:0.0 2>/dev/null`);
 
     const token = randomUUID();
     const startMarker = `__MCP_START__${token}__`;
@@ -1097,7 +1097,7 @@ class PersistentSession {
 
     const escapedCmd = command.replace(/'/g, "'\\''");
     const sendCmd = `echo ${startMarker}; ${escapedCmd}; echo ${endMarker}$?`;
-    const sendResult = await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName} '${sendCmd}' Enter`);
+    const sendResult = await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName}:0.0 '${sendCmd}' Enter`);
     if (sendResult.exitCode !== 0) {
       throw new Error(`tmux send-keys failed: ${sendResult.output}`);
     }
@@ -1135,7 +1135,7 @@ class PersistentSession {
       await new Promise(r => setTimeout(r, pollIntervalMs));
       pollCount++;
 
-      const capResult = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName} -p -S -200 2>&1`);
+      const capResult = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName}:0.0 -p -S -200 2>&1`);
       if (capResult.exitCode !== 0 && pollCount <= 3) continue;
       if (capResult.exitCode !== 0) throw new Error(`tmux capture-pane failed: ${capResult.output}`);
 
@@ -1203,7 +1203,7 @@ class PersistentSession {
 
     // Send raw input — just the keystrokes, no echo/marker wrapping
     const escapedInput = input.replace(/'/g, "'\\''");
-    const sendResult = await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName} '${escapedInput}' Enter`);
+    const sendResult = await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName}:0.0 '${escapedInput}' Enter`);
     if (sendResult.exitCode !== 0) {
       throw new Error(`tmux send-keys failed: ${sendResult.output}`);
     }
