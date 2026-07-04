@@ -343,7 +343,7 @@ export function escapeCommandForShell(command: string): string {
 }
 
 const activeSessions = new Map<string, PersistentSession>();
-const activeTunnels = new Map<string, { server: net.Server; localPort: number; remoteHost: string; remotePort: number; sessionId: string }>();
+const activeTunnels = new Map<string, { server: net.Server; sockets: Set<net.Socket>; localPort: number; remoteHost: string; remotePort: number; sessionId: string }>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
@@ -626,8 +626,9 @@ server.tool(
     if (activeTunnels.has(id)) {
       throw new McpError(ErrorCode.InvalidParams, `Tunnel '${id}' already exists`);
     }
-    const tcpServer = await session.forwardPort(local_port, remote_host, remote_port);
-    activeTunnels.set(id, { server: tcpServer, localPort: local_port, remoteHost: remote_host, remotePort: remote_port, sessionId: session_id });
+    const sockets = new Set<net.Socket>();
+    const tcpServer = await session.forwardPort(local_port, remote_host, remote_port, sockets);
+    activeTunnels.set(id, { server: tcpServer, sockets, localPort: local_port, remoteHost: remote_host, remotePort: remote_port, sessionId: session_id });
     return { content: [{ type: 'text', text: `Tunnel '${id}' active: 127.0.0.1:${local_port} -> ${remote_host}:${remote_port}` }] };
   }
 );
@@ -643,7 +644,13 @@ server.tool(
     if (!tunnel) {
       throw new McpError(ErrorCode.InvalidParams, `Tunnel '${tunnel_id}' does not exist`);
     }
-    await new Promise<void>((resolve) => tunnel.server.close(() => resolve()));
+    // Destroy all active sockets first so server.close() doesn't wait for them
+    for (const sock of tunnel.sockets) sock.destroy();
+    tunnel.sockets.clear();
+    await Promise.race([
+      new Promise<void>((resolve) => tunnel.server.close(() => resolve())),
+      new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+    ]);
     activeTunnels.delete(tunnel_id);
     return { content: [{ type: 'text', text: `Tunnel '${tunnel_id}' stopped` }] };
   }
@@ -1228,7 +1235,7 @@ class PersistentSession {
     return result;
   }
 
-  forwardPort(localPort: number, remoteHost: string, remotePort: number): Promise<net.Server> {
+  forwardPort(localPort: number, remoteHost: string, remotePort: number, sockets: Set<net.Socket>): Promise<net.Server> {
     return new Promise((resolve, reject) => {
       if (!this.conn) {
         reject(new McpError(ErrorCode.InternalError, 'SSH connection not ready'));
@@ -1236,6 +1243,8 @@ class PersistentSession {
       }
       const conn = this.conn;
       const tcpServer = net.createServer((localSocket) => {
+        sockets.add(localSocket);
+        localSocket.once('close', () => sockets.delete(localSocket));
         conn.forwardOut('127.0.0.1', localPort, remoteHost, remotePort, (err, channel) => {
           if (err) {
             localSocket.destroy();
