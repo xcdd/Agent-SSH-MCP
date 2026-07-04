@@ -930,12 +930,21 @@ class PersistentSession {
         try {
           return await this.executeViaTmux(command);
         } catch (err) {
-          // tmux execution failed, fall back to direct shell
           this.tmuxReady = false;
           console.error(`SSH session ${this.id}: tmux execution failed, falling back to direct shell:`, err);
           return this.executeDirect(command);
         }
       }
+    }
+
+    // Direct shell mode — only allow tmux installation/diagnostic commands.
+    // All other commands must wait until tmux is available (call setup-tmux after installing).
+    const isTmuxSetupCmd = /\b(apt(-get)?|yum|dnf|apk|pacman|brew|pkg|zypper|emerge)\b.*\btmux\b|\bwhich\s+tmux\b|\bwhereis\s+tmux\b|\btmux\s+-V\b/i.test(command);
+    if (!isTmuxSetupCmd) {
+      return {
+        output: '[ERROR] tmux is not available on this server. Direct shell mode only accepts tmux installation commands (e.g. "apt install tmux"). After installing, call setup-tmux to enable full command execution.',
+        exitCode: 1,
+      };
     }
     return this.executeDirect(command);
   }
