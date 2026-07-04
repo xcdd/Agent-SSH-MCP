@@ -1181,12 +1181,18 @@ class PersistentSession {
         if (INTERACTIVE_PROMPT_RE.test(regionTrimmed)) {
           return { output: cleanPaneOutput(region), exitCode: -2 };
         }
-        // Stability: last few lines unchanged for STABLE_THRESHOLD polls
-        const tail = cleanPaneOutput(region).split('\n').filter(l => l.trim()).slice(-5).join('\n');
-        if (tail && tail === lastTail) {
+        // Stability: last few lines unchanged for STABLE_THRESHOLD polls,
+        // AND last visible line must end with a prompt-like character.
+        // This prevents false positives when a script pauses during network I/O.
+        const cleanedRegion = cleanPaneOutput(region);
+        const visibleLines = cleanedRegion.split('\n').filter(l => l.trim());
+        const lastLine = visibleLines.at(-1) ?? '';
+        const endsLikePrompt = /[?:>\]#$）)]\s*$/.test(lastLine) || /\[.*[yYnN/]\]\s*$/.test(lastLine);
+        const tail = visibleLines.slice(-5).join('\n');
+        if (tail && tail === lastTail && endsLikePrompt) {
           stablePollCount++;
           if (stablePollCount >= STABLE_THRESHOLD) {
-            return { output: cleanPaneOutput(region), exitCode: -2 };
+            return { output: cleanedRegion, exitCode: -2 };
           }
         } else {
           stablePollCount = 0;
@@ -1195,7 +1201,7 @@ class PersistentSession {
       }
     }
 
-    const { output: finalPane } = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName} -p -S -200 2>&1`);
+    const { output: finalPane } = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName}:0.0 -p -S -200 2>&1`);
     return { output: cleanPaneOutput(finalPane), exitCode: -1 };
   }
 
