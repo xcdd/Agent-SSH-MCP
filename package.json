@@ -1,0 +1,61 @@
+{
+  "name": "agent-ssh-mcp",
+  "license": "MIT",
+  "version": "1.0.0",
+  "description": "MCP server for persistent SSH sessions with tmux integration, port forwarding, and SFTP file writes — designed for AI agent workflows.",
+  "type": "module",
+  "bin": {
+    "agent-ssh-mcp": "build/index.js"
+  },
+  "scripts": {
+    "prepare": "npm run build",
+    "build": "tsc && shx chmod +x build/*.js",
+    "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
+    "test": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run",
+    "test:watch": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest",
+    "coverage": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --coverage"
+  },
+  "files": [
+    "build"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "ssh2": "^1.17.0",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/ssh2": "^1.15.5",
+    "cross-env": "^7.0.3",
+    "shx": "^0.4.0",
+    "testcontainers": "^11.7.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "homepage": "https://github.com/xcdd/Agent-SSH-MCP#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xcdd/Agent-SSH-MCP.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xcdd/Agent-SSH-MCP/issues"
+  },
+  "keywords": [
+    "ssh",
+    "mcp",
+    "model-context-protocol",
+    "tmux",
+    "port-forwarding",
+    "sftp",
+    "agent",
+    "remote",
+    "automation",
+    "typescript"
+  ],
+  "author": "xcdd",
+  "engines": {
+    "node": ">=18"
+  }
+}
