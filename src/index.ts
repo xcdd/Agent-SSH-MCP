@@ -734,7 +734,7 @@ class PersistentSession {
   private sftp: SFTPWrapper | null = null;
   // When a tmux command returns exitCode -2 (waiting for input), these fields persist
   // across the exec call boundary so the next exec sends raw input instead of a wrapped command.
-  private tmuxPendingMarkers: { startMarker: string; endMarker: string } | null = null;
+  private tmuxPendingMarkers: { startMarker: string; endMarker: string; lastSnapshot: string } | null = null;
   private tmuxWaitingForInput = false;
 
   constructor(
@@ -1117,11 +1117,12 @@ class PersistentSession {
     }
 
     // Persist markers so executeInteractiveInput can continue polling if we return -2
-    this.tmuxPendingMarkers = { startMarker, endMarker };
+    this.tmuxPendingMarkers = { startMarker, endMarker, lastSnapshot: '' };
 
     const result = await this.pollForCompletion(startMarker, endMarker, 30000);
     if (result.exitCode === -2) {
       this.tmuxWaitingForInput = true;
+      this.tmuxPendingMarkers.lastSnapshot = result.output;
     } else {
       this.tmuxPendingMarkers = null;
     }
@@ -1216,12 +1217,43 @@ class PersistentSession {
   // Sends raw keystrokes (no marker wrapping) and resumes polling for the original end marker.
   private async executeInteractiveInput(input: string): Promise<{ output: string; exitCode: number }> {
     this.tmuxWaitingForInput = false;
-    const { startMarker, endMarker } = this.tmuxPendingMarkers!;
+    const { startMarker, endMarker, lastSnapshot } = this.tmuxPendingMarkers!;
 
     this.lastCommand = input;
     this.resetInactivityTimer();
 
-    // Send raw input — just the keystrokes, no echo/marker wrapping
+    // Pre-check: capture pane before sending to detect if state has already changed.
+    const preCapture = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName}:0.0 -p -S -200 2>&1`);
+    if (preCapture.exitCode === 0) {
+      const endMarkerRe = new RegExp(`${escapeRegex(endMarker)}(\\d+)(?:\\n|$)`, 'm');
+      const endMatch = preCapture.output.match(endMarkerRe);
+      if (endMatch) {
+        // Script already finished — return its result without sending our input
+        const exitCode = parseInt(endMatch[1], 10);
+        const startMarkerRe = new RegExp(`\\n${escapeRegex(startMarker)}\\n`);
+        const startMatch = preCapture.output.match(startMarkerRe);
+        const cmdOutput = startMatch
+          ? preCapture.output.slice(startMatch.index! + 1 + startMatch[0].length - 1, endMatch.index!)
+          : preCapture.output.slice(0, endMatch.index!);
+        this.tmuxPendingMarkers = null;
+        return { output: cleanPaneOutput(cmdOutput), exitCode: Number.isNaN(exitCode) ? 0 : exitCode };
+      }
+
+      // Check if pane content has drifted significantly from when -2 was returned.
+      // If so, return the new state without sending — let the AI re-assess.
+      const currentClean = cleanPaneOutput(preCapture.output);
+      if (lastSnapshot && currentClean !== lastSnapshot) {
+        // Find overlap: if the prompt text we saw is no longer in the pane, state has changed
+        const snapshotLastLine = lastSnapshot.split('\n').filter(l => l.trim()).at(-1) ?? '';
+        if (snapshotLastLine && !currentClean.includes(snapshotLastLine)) {
+          this.tmuxWaitingForInput = true;
+          this.tmuxPendingMarkers!.lastSnapshot = currentClean;
+          return { output: `[State changed before input was sent. Current pane:]\n${currentClean}`, exitCode: -2 };
+        }
+      }
+    }
+
+    // State still matches — send raw input
     const escapedInput = input.replace(/'/g, "'\\''");
     const sendResult = await this.executeDirect(`tmux send-keys -t ${this.tmuxSessionName}:0.0 '${escapedInput}' Enter`);
     if (sendResult.exitCode !== 0) {
@@ -1231,6 +1263,7 @@ class PersistentSession {
     const result = await this.pollForCompletion(startMarker, endMarker, 30000);
     if (result.exitCode === -2) {
       this.tmuxWaitingForInput = true;
+      this.tmuxPendingMarkers!.lastSnapshot = result.output;
     }
     return result;
   }
