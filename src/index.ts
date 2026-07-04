@@ -485,7 +485,9 @@ server.tool(
     }
     const { output, exitCode } = await session.execute(sanitizedCommand);
     let resultText: string;
-    if (exitCode === -1) {
+    if (exitCode === -2) {
+      resultText = `[Command is waiting for input — use the exec tool to send the required response (e.g. "y", a password, etc.)]\n${output}`;
+    } else if (exitCode === -1) {
       resultText = `[tmux capture timed out — command may still be running. Partial output:]\n${output}`;
     } else if (exitCode !== 0) {
       resultText = `Exit code: ${exitCode}\n${output}`;
@@ -1094,6 +1096,19 @@ class PersistentSession {
     const pollIntervalMs = 300;
     const startTime = Date.now();
     let pollCount = 0;
+    // For interactive-prompt detection
+    let lastAfterStart = '';
+    let stablePollCount = 0;
+    const STABLE_THRESHOLD = 4; // ~1.2s stable → likely waiting for input
+    const INTERACTIVE_PROMPT_RE = /\[Y\/n\]|\[y\/N\]|\(yes\/no\)|\[yes\/no\]|\(y\/n\)|\(Y\/N\)|password\s*:|\bpassphrase\s*:|--More--|continue\s*\?\s*\[|are you sure|do you want to|\(y or n\)|\(yes or no\)|enter .{0,30}:/i;
+    const startMarkerLineRegex = new RegExp(`\\n${escapeRegex(startMarker)}\\n`);
+    const endMarkerLineRegex = new RegExp(`${escapeRegex(endMarker)}(\\d+)(?:\\n|$)`, 'm');
+
+    const cleanOutput = (s: string) => s
+      .replace(/\r/g, '')
+      .replace(/\x1b\[\?[0-9]+[hl]/g, '')
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+      .replace(/\s+$/, '');
 
     while (Date.now() - startTime < maxWaitMs) {
       await new Promise(r => setTimeout(r, pollIntervalMs));
@@ -1109,40 +1124,53 @@ class PersistentSession {
 
       const pane = capResult.output;
 
-      // Match end marker output line: "...content__MCP_DONE__uuid__0\n"
-      // Don't require a leading \n — command output may not end with a newline.
-      // The input line has "echo __MCP_DONE__$?" (ends with $?), never digits, so no false match.
-      const endMarkerLineRegex = new RegExp(`${escapeRegex(endMarker)}(\\d+)(?:\\n|$)`, 'm');
+      // Check for end marker first
       const endMatch = pane.match(endMarkerLineRegex);
       if (endMatch) {
         const exitCode = parseInt(endMatch[1], 10);
-        const endMarkerLineStart = endMatch.index!; // marker starts here (no leading \n to skip)
+        const endMarkerLineStart = endMatch.index!;
 
-        // Search for start marker on its own output line: "\n__MCP_START__xxx__\n"
-        const startMarkerLineRegex = new RegExp(`\\n${escapeRegex(startMarker)}\\n`);
         const startMatch = pane.match(startMarkerLineRegex);
         let cmdOutput: string;
         if (startMatch) {
-          const startMarkerLineEnd = startMatch.index! + 1 + startMatch[0].length - 1; // after the trailing \n
+          const startMarkerLineEnd = startMatch.index! + 1 + startMatch[0].length - 1;
           cmdOutput = pane.slice(startMarkerLineEnd, endMarkerLineStart);
         } else {
-          // Fallback: output is everything before end marker line
           cmdOutput = pane.slice(0, endMarkerLineStart);
         }
 
-        cmdOutput = cmdOutput
-          .replace(/\r/g, '')
-          .replace(/\x1b\[\?[0-9]+[hl]/g, '')
-          .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-          .replace(/\s+$/, '');
+        return { output: cleanOutput(cmdOutput), exitCode: Number.isNaN(exitCode) ? 0 : exitCode };
+      }
 
-        return { output: cmdOutput, exitCode: Number.isNaN(exitCode) ? 0 : exitCode };
+      // Interactive-prompt detection: only after start marker has appeared
+      const startMatch = pane.match(startMarkerLineRegex);
+      if (startMatch) {
+        const afterStart = pane.slice(startMatch.index! + 1 + startMatch[0].length - 1);
+        const afterStartTrimmed = afterStart.trim();
+
+        if (afterStartTrimmed) {
+          // Immediate: known interactive prompt pattern
+          if (INTERACTIVE_PROMPT_RE.test(afterStartTrimmed)) {
+            return { output: cleanOutput(afterStart), exitCode: -2 };
+          }
+
+          // Stability: content unchanged for STABLE_THRESHOLD polls
+          if (afterStartTrimmed === lastAfterStart) {
+            stablePollCount++;
+            if (stablePollCount >= STABLE_THRESHOLD) {
+              return { output: cleanOutput(afterStart), exitCode: -2 };
+            }
+          } else {
+            stablePollCount = 0;
+            lastAfterStart = afterStartTrimmed;
+          }
+        }
       }
     }
 
     // Timeout: return whatever we have
     const { output: pane } = await this.executeDirect(`tmux capture-pane -t ${this.tmuxSessionName} -p -S -200 2>&1`);
-    return { output: pane.replace(/\r/g, '').replace(/\x1b\[\?[0-9]+[hl]/g, '').replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\s+$/, ''), exitCode: -1 };
+    return { output: cleanOutput(pane), exitCode: -1 };
   }
 
   forwardPort(localPort: number, remoteHost: string, remotePort: number): Promise<net.Server> {
