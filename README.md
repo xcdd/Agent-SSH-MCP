@@ -8,14 +8,37 @@ Based on [ssh-mcp-sessions](https://github.com/fryjustinc/ssh-mcp-sessions) by J
 
 ## What's improved over the original
 
+The original [fryjustinc/ssh-mcp-sessions](https://github.com/fryjustinc/ssh-mcp-sessions) provides 8 basic tools that execute commands directly in a hidden ssh2 shell buffer. This repo is a significant rework:
+
+### Architecture changes
+
+| Original | This repo |
+|----------|-----------|
+| Commands run in a hidden ssh2 shell; output captured via in-memory buffer | Commands run inside a **tmux session** (`ai`); user can attach and watch live with `tmux attach -t ai` |
+| Single end marker: `printf '__MCP_DONE__%s%d\n' $?` — no start marker, no polling | Dual start+end markers polled via `capture-pane`; output extracted between them |
+| No reconnect logic — connection loss kills the session | Auto-reconnects on next command; keepalive every 30 s |
+| No file transfer | **SFTP**: `upload-file`, `download-file`, `write-remote-file` |
+| No port forwarding | `forward-port` / `stop-forward` via ssh2 `forwardOut` |
+
+### New tools added
+
+| Tool | Purpose |
+|------|---------|
+| `setup-tmux` | (Re)initialize tmux on an existing session |
+| `upload-file` | Upload local file to remote via SFTP |
+| `download-file` | Download remote file to local via SFTP |
+| `write-remote-file` | Write text content directly via SFTP — no shell, no quoting issues, no heredoc |
+| `forward-port` | Forward a local TCP port to a remote host:port |
+| `stop-forward` | Stop a port forward tunnel |
+
+### Reliability fixes
+
 | Issue | Root cause | Fix |
 |-------|-----------|-----|
-| Command output contained the entire pane history | End marker regex required a preceding `\n`; commands whose output has no trailing newline caused the marker to be missed → 30 s timeout → full pane returned as fallback | Regex changed to `endMarker(\d+)(?:\n|$)` — no longer depends on a preceding newline |
-| Long sessions accumulated large scrollback, slowing capture | `capture-pane -S -1000` scanned 1000 lines of history on every poll | `tmux clear-history` before each command + reduced window to `-S -200` |
-| heredoc (`<< EOF`) hung the session indefinitely | tmux waits for EOF input that never arrives via `send-keys` | Detected and rejected immediately with a helpful error; use `write-remote-file` instead |
-| exit code `-1` was indistinguishable from a real non-zero exit | Timeout and true failure both returned the same code | Timeout now returns `[tmux capture timed out — command may still be running]` |
-| No way to access remote services (e.g. PostgreSQL) locally | No port-forwarding tool existed | New `forward-port` / `stop-forward` tools using ssh2 `forwardOut` |
-| Writing files via shell was fragile (quoting, special chars, heredoc) | Shell-based writes require careful escaping and break with special characters | New `write-remote-file` tool writes directly via SFTP — no shell involved |
+| Captured output contained entire pane history | End marker regex required a preceding `\n`; commands without trailing newline caused marker detection to fail → 30 s timeout → full pane returned as fallback | Regex changed to `endMarker(\d+)(?:\n|$)` |
+| Long sessions accumulated large scrollback, slowing polling | `capture-pane -S -1000` scanned 1000 lines on every poll | `tmux clear-history` before each command + window reduced to `-S -200` |
+| heredoc (`<< EOF`) hung the session | tmux waits for EOF input that never arrives | Detected and rejected with a helpful error |
+| exit code `-1` was indistinguishable from a real command failure | Timeout and true failure both returned the same code | Timeout now returns `[tmux capture timed out — command may still be running]` |
 
 ---
 
