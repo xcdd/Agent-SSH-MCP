@@ -683,7 +683,7 @@ server.tool(
 
 server.tool(
   "start-session",
-  "Start a new SSH session for a stored host. Automatically initializes tmux if available (user can attach with the tmux session name returned in the response). Falls back to direct shell if tmux is not installed. IMPORTANT: Commands that install tmux itself should be executed BEFORE calling start-session, or use setup-tmux after installation. When tmux is active, the exec tool automatically routes commands through tmux — just pass the actual command, do NOT manually write 'tmux send-keys'. TIP: for fast file transfers on this host, call install-fast-channel once.",
+  "Start a new SSH session for a stored host. Initializes tmux if available; falls back to direct shell. Install tmux BEFORE calling this, or use setup-tmux after. When tmux is active, exec routes commands automatically — do not write tmux send-keys manually. For fast file transfers on this host, call install-fast-channel once.",
   {
     host_id: z.string().describe("Identifier of the host to connect"),
     sessionId: z.string().optional().describe("Optional session identifier; generated if omitted"),
@@ -722,7 +722,7 @@ server.tool(
 
 server.tool(
   "exec",
-  "Execute a shell command on an existing SSH session. When tmux is active, commands are automatically sent via tmux (non-blocking, user can observe with 'tmux attach -t ai'). IMPORTANT: Just pass the actual command to execute — do NOT manually write 'tmux send-keys' or 'tmux capture-pane', the plugin handles tmux routing automatically. If tmux session is lost, automatically falls back to direct shell mode. INTERACTIVE COMMANDS: When the output contains '[Command is waiting for input...]', call exec again with just the raw response (e.g. 'y', 'n', a password) — the plugin will route it as raw keystrokes to the waiting prompt, NOT as a new wrapped command.",
+  "Execute a shell command on an existing SSH session. When tmux is active, commands are routed automatically — just pass the command, do not write tmux send-keys. Falls back to direct shell if tmux is lost. If output contains '[Command is waiting for input...]', call exec again with just the raw response (e.g. 'y', a password).",
   {
     session_id: z.string().describe("Identifier of the session to use"),
     command: z.string().describe("Command to execute"),
@@ -769,7 +769,7 @@ server.tool(
 
 server.tool(
   "upload-file",
-  "Upload a local file to the remote server. Automatically uses the high-speed channel (parallel HTTP via the fastd helper) when it is installed on the host, and falls back to SFTP otherwise. For large files or slow links, call install-fast-channel once on this host to enable the fast channel — typically 10-50x faster than SFTP on high-latency or lossy links.",
+  "Upload a local file to the remote server. Preferred over echo/cat/heredoc — handles binary and special characters correctly. Uses the fast channel (fastd) when installed on the host, falls back to SFTP otherwise; for large files or slow links call install-fast-channel once — typically 10-50x faster.",
   {
     session_id: z.string().describe("Identifier of the session to use"),
     local_path: z.string().describe("Absolute path of the local file to upload"),
@@ -829,7 +829,7 @@ server.tool(
 
 server.tool(
   "write-remote-file",
-  "Write text content directly to a file on the remote server via SFTP. Preferred over echo/cat/heredoc for writing files — reliable, handles special characters, no shell quoting issues.",
+  "Write text content directly to a file on the remote server via SFTP. Preferred over echo/cat/heredoc — reliable, handles special characters.",
   {
     session_id: z.string().describe("Identifier of the session to use"),
     remote_path: z.string().describe("Absolute path on the remote server to write"),
@@ -847,7 +847,7 @@ server.tool(
 
 server.tool(
   "setup-tmux",
-  "Initialize tmux session on an existing SSH session. Use this after installing tmux on the remote server to switch from direct shell mode to tmux mode. When tmux is active, user can attach with the session name returned by start-session to observe commands in real-time.",
+  "Initialize tmux on an existing SSH session. Use after installing tmux to switch from direct shell mode. When active, user can attach with the session name returned by start-session.",
   {
     session_id: z.string().describe("Identifier of the session to initialize tmux on"),
   },
@@ -863,7 +863,7 @@ server.tool(
 
 server.tool(
   "forward-port",
-  "Create a local TCP port forward through the SSH session. Useful for accessing remote services (e.g. databases) locally. After calling this, connect to 127.0.0.1:<local_port> as if it were <remote_host>:<remote_port> on the server.",
+  "Create a local TCP port forward through the SSH session. After calling this, connect to 127.0.0.1:<local_port> to reach <remote_host>:<remote_port> on the server.",
   {
     session_id: z.string().describe("Identifier of the SSH session to use"),
     local_port: z.number().int().positive().describe("Local port to listen on (e.g. 15432)"),
