@@ -137,9 +137,39 @@ Authentication priority: password → private key → SSH agent (`SSH_AUTH_SOCK`
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `upload-file` | `session_id`, `local_path`, `remote_path` | Upload local file via SFTP (**preferred for large/binary files**) |
-| `download-file` | `session_id`, `remote_path`, `local_path` | Download remote file via SFTP |
+| `install-fast-channel` | `session_id` | One-time install of the high-speed transfer helper on the host (requires `python3`) |
+| `upload-file` | `session_id`, `local_path`, `remote_path` | Upload local file — uses the fast channel when installed, SFTP otherwise (**preferred for large/binary files**) |
+| `download-file` | `session_id`, `remote_path`, `local_path` | Download remote file — same fast-channel/SFTP selection |
 | `write-remote-file` | `session_id`, `remote_path`, `content` | Write text content directly via SFTP — handles special characters, no shell quoting issues |
+
+#### High-speed transfer channel (fastd)
+
+Stock SFTP caps throughput at roughly `channel window / RTT` (ssh2 keeps ~2 MB in flight on a
+hard-coded 2 MB channel window), which makes transfers painful on high-latency or lossy links —
+a 340 ms route measures ~0.2 MB/s with the naive stream implementation and ~3 MB/s with pipelined
+SFTP, no matter how much bandwidth the path has.
+
+`install-fast-channel` fixes this with a small Python helper (`~/.agent-ssh-mcp/fastd.py`, stdlib
+only, works on mainstream Linux distros):
+
+- Transfers run as parallel HTTP range requests (8 streams × 4 MB chunks) instead of SFTP.
+- **Opportunistic direct mode**: on LAN or unfiltered routes the helper is reached directly, and
+  parallel independent TCP streams multiply throughput.
+- **SSH tunnel fallback**: if the direct route is blocked (firewall, filtered transit), each HTTP
+  stream is forwarded through the existing SSH connection — no ports need to be opened on either
+  end beyond SSH itself.
+- The helper binds an ephemeral port, requires a per-session random token on every request, and
+  exits by itself after 30 minutes idle (it is also killed when the session closes).
+- Detection is automatic: every future session probes for the helper on first large transfer and
+  uses the fast channel when present; SFTP (pipelined `fastPut`/`fastGet`) remains the fallback.
+
+Measured results (64–256 MB random files): LAN (4.5 ms RTT) 176 MB/s up / 162 MB/s down; a
+340 ms-filtered WAN route 5.2 MB/s up / 8.4 MB/s down — versus 0.27 / 0.20 MB/s with the original
+stream implementation.
+
+SSH-level compression is also preferred during negotiation (`zlib@openssh.com` first), and the
+bundled ssh2 patch (`patches/`) raises the channel window from 2 MB to 16 MB, which lifts SFTP
+fallback and port-forwarding throughput on high-BDP links as well.
 
 ### Port forwarding
 

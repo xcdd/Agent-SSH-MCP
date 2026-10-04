@@ -1,7 +1,7 @@
 {
   "name": "agent-ssh-mcp",
   "license": "MIT",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server for persistent SSH sessions with tmux integration, port forwarding, and SFTP file writes — designed for AI agent workflows.",
   "type": "module",
   "bin": {
@@ -13,7 +13,8 @@
     "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
     "test": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run",
     "test:watch": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest",
-    "coverage": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --coverage"
+    "coverage": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --coverage",
+    "postinstall": "patch-package"
   },
   "files": [
     "build"
@@ -27,6 +28,7 @@
     "@types/node": "^24.5.2",
     "@types/ssh2": "^1.15.5",
     "cross-env": "^7.0.3",
+    "patch-package": "^8.0.0",
     "shx": "^0.4.0",
     "testcontainers": "^11.7.0",
     "ts-node": "^10.9.2",

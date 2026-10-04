@@ -7,7 +7,7 @@ import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFile, writeFile, mkdir, stat } from 'fs/promises';
+import { readFile, writeFile, mkdir, stat, open as openFileHandle } from 'fs/promises';
 import { createReadStream, createWriteStream, mkdirSync } from 'fs';
 import { resolve as resolvePath, dirname } from 'path';
 import os from 'os';
@@ -45,6 +45,237 @@ function cleanPaneOutput(s: string): string {
 
 const HOSTS_DIR = resolvePath(os.homedir(), '.ssh-mcp');
 const HOSTS_FILE = resolvePath(HOSTS_DIR, 'hosts.json');
+
+// ── High-speed transfer channel ("fast channel") ───────────────────────────
+// SFTP transfers (ssh2) keep at most ~2MB in flight (hard-coded channel window),
+// which caps throughput at roughly window/RTT — very slow on high-latency or
+// lossy links. When the fastd helper is installed on the remote host, transfers
+// go over parallel direct HTTP range requests instead, with SFTP as fallback.
+
+const FAST_MIN_BYTES = 4 * 1024 * 1024; // engage the fast channel for files >= 4MB (helper startup amortizes there)
+const FAST_CHUNK = 4 * 1024 * 1024; // 4MB per HTTP request
+const FAST_CONCURRENCY = 8; // parallel HTTP streams
+
+type FastdState =
+  | { status: 'unchecked' }
+  | { status: 'no-helper' }
+  | { status: 'ready'; baseUrl: string; mode: 'direct' | 'tunnel'; token: string; localServer?: net.Server; pid: number | null; remoteDir: string }
+  | { status: 'unreachable' }
+  | { status: 'failed' };
+
+function abortAfter(ms: number): AbortSignal {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  timer.unref?.();
+  return controller.signal;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+const FASTD_SCRIPT = `#!/usr/bin/env python3
+# agent-ssh-mcp fast transfer helper ("fastd").
+# Installed and started on demand by the SSH MCP plugin's high-speed channel.
+# Token-gated HTTP file server with parallel ranged GET/PUT support -- much
+# faster than SFTP on high-latency or lossy links. Binds 0.0.0.0 on an
+# ephemeral port, requires the X-Fastd-Token header for every request, and
+# exits by itself after --idle seconds without requests.
+
+import argparse
+import json
+import os
+import re
+import socketserver
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs, unquote
+
+TOKEN = os.environ.get("OGOC_FASTD_TOKEN", "")
+PORT_FILE = None
+LAST_REQUEST = time.time()
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _authorized(self):
+        if not TOKEN or self.headers.get("X-Fastd-Token") != TOKEN:
+            self.send_error(403)
+            return False
+        return True
+
+    def _one(self, key):
+        return unquote(parse_qs(urlparse(self.path).query).get(key, [""])[0])
+
+    def _json(self, obj, status=200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        global LAST_REQUEST
+        LAST_REQUEST = time.time()
+        try:
+            if not self._authorized():
+                return
+            cmd = urlparse(self.path).path
+            if cmd == "/stat":
+                p = self._one("path")
+                if not p:
+                    return self._json({"error": "path required"}, 400)
+                if os.path.isdir(p):
+                    return self._json({"path": p, "isdir": True, "exists": True, "size": 0})
+                try:
+                    return self._json({"path": p, "isdir": False, "exists": True, "size": os.path.getsize(p)})
+                except OSError:
+                    return self._json({"path": p, "isdir": False, "exists": False, "size": 0})
+            if cmd == "/read":
+                p = self._one("path")
+                if not p:
+                    return self._json({"error": "path required"}, 400)
+                try:
+                    size = os.path.getsize(p)
+                except OSError as e:
+                    return self._json({"error": str(e)}, 404)
+                start, end, status = 0, size - 1, 200
+                rng = self.headers.get("Range")
+                if rng:
+                    m = re.match(r"bytes=(\\d*)-(\\d*)$", rng.strip())
+                    if not m:
+                        return self._json({"error": "bad range"}, 400)
+                    if m.group(1):
+                        start = int(m.group(1))
+                        end = int(m.group(2)) if m.group(2) else size - 1
+                    else:
+                        n = int(m.group(2))
+                        start, end = max(0, size - n), size - 1
+                    if start >= size or start > end:
+                        return self._json({"error": "range not satisfiable"}, 416)
+                    end = min(end, size - 1)
+                    status = 206
+                length = end - start + 1
+                self.send_response(status)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(length))
+                if status == 206:
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+                self.end_headers()
+                with open(p, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            self._json({"error": "not found"}, 404)
+        except (ConnectionError, BrokenPipeError):
+            pass
+        except Exception as e:
+            try:
+                self._json({"error": str(e)}, 500)
+            except Exception:
+                pass
+
+    def do_POST(self):
+        global LAST_REQUEST
+        LAST_REQUEST = time.time()
+        try:
+            if not self._authorized():
+                return
+            cmd = urlparse(self.path).path
+            length = int(self.headers.get("Content-Length") or 0)
+            if cmd == "/write":
+                p, offset = self._one("path"), int(self._one("offset") or 0)
+                if not p:
+                    return self._json({"error": "path required"}, 400)
+                fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o644)
+                try:
+                    written, remaining = 0, length
+                    while remaining > 0:
+                        data = self.rfile.read(min(1024 * 1024, remaining))
+                        if not data:
+                            break
+                        os.pwrite(fd, data, offset + written)
+                        written += len(data)
+                        remaining -= len(data)
+                finally:
+                    os.close(fd)
+                return self._json({"written": written})
+            if cmd == "/truncate":
+                p, size = self._one("path"), int(self._one("size") or 0)
+                if not p:
+                    return self._json({"error": "path required"}, 400)
+                fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o644)
+                try:
+                    os.ftruncate(fd, size)
+                finally:
+                    os.close(fd)
+                return self._json({"ok": True})
+            if length > 0:
+                self.rfile.read(length)
+            self._json({"error": "not found"}, 404)
+        except (ConnectionError, BrokenPipeError):
+            pass
+        except Exception as e:
+            try:
+                self._json({"error": str(e)}, 500)
+            except Exception:
+                pass
+
+
+def main():
+    global PORT_FILE
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--port-file", default=None)
+    ap.add_argument("--idle", type=int, default=1800)
+    args = ap.parse_args()
+    PORT_FILE = args.port_file
+    if not TOKEN:
+        print("FASTD_ERROR: OGOC_FASTD_TOKEN not set", file=sys.stderr)
+        sys.exit(2)
+    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
+    port = httpd.server_address[1]
+    if PORT_FILE:
+        with open(PORT_FILE, "w") as f:
+            f.write(str(port))
+    print("FASTD_READY port=%d" % port, flush=True)
+
+    def reaper():
+        while True:
+            time.sleep(30)
+            if time.time() - LAST_REQUEST > args.idle:
+                if PORT_FILE:
+                    try:
+                        os.remove(PORT_FILE)
+                    except OSError:
+                        pass
+                os._exit(0)
+
+    threading.Thread(target=reaper, daemon=True).start()
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+`;
 
 // ── Proxy detection ────────────────────────────────────────────────────────
 
@@ -348,11 +579,18 @@ const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
   name: 'SSH MCP Server',
-  version: '1.0.9',
+  version: '1.1.0',
   capabilities: {
     resources: {},
     tools: {},
   },
+}, {
+  instructions:
+    'File transfers (upload-file/download-file) automatically use the high-speed channel ' +
+    '(parallel HTTP via a small helper daemon) when it is installed on the target host, ' +
+    'and fall back to SFTP otherwise. On hosts where transfers feel slow, call ' +
+    'install-fast-channel once per host (requires python3; works on mainstream Linux distros) ' +
+    'to enable it — subsequent sessions detect it automatically.',
 });
 
 server.tool(
@@ -445,7 +683,7 @@ server.tool(
 
 server.tool(
   "start-session",
-  "Start a new SSH session for a stored host. Automatically initializes tmux if available (user can attach with the tmux session name returned in the response). Falls back to direct shell if tmux is not installed. IMPORTANT: Commands that install tmux itself should be executed BEFORE calling start-session, or use setup-tmux after installation. When tmux is active, the exec tool automatically routes commands through tmux — just pass the actual command, do NOT manually write 'tmux send-keys'.",
+  "Start a new SSH session for a stored host. Automatically initializes tmux if available (user can attach with the tmux session name returned in the response). Falls back to direct shell if tmux is not installed. IMPORTANT: Commands that install tmux itself should be executed BEFORE calling start-session, or use setup-tmux after installation. When tmux is active, the exec tool automatically routes commands through tmux — just pass the actual command, do NOT manually write 'tmux send-keys'. TIP: for fast file transfers on this host, call install-fast-channel once.",
   {
     host_id: z.string().describe("Identifier of the host to connect"),
     sessionId: z.string().optional().describe("Optional session identifier; generated if omitted"),
@@ -531,7 +769,7 @@ server.tool(
 
 server.tool(
   "upload-file",
-  "Upload a local file to the remote server via SFTP. PREFERRED method for writing files — more reliable than echo/cat/heredoc commands, handles binary content and special characters correctly.",
+  "Upload a local file to the remote server. Automatically uses the high-speed channel (parallel HTTP via the fastd helper) when it is installed on the host, and falls back to SFTP otherwise. For large files or slow links, call install-fast-channel once on this host to enable the fast channel — typically 10-50x faster than SFTP on high-latency or lossy links.",
   {
     session_id: z.string().describe("Identifier of the session to use"),
     local_path: z.string().describe("Absolute path of the local file to upload"),
@@ -553,7 +791,7 @@ server.tool(
 
 server.tool(
   "download-file",
-  "Download a file from the remote server via SFTP.",
+  "Download a file from the remote server. Automatically uses the high-speed channel (parallel HTTP via the fastd helper) when it is installed on the host, and falls back to SFTP otherwise. For large files or slow links, call install-fast-channel once on this host to enable the fast channel — typically 10-50x faster than SFTP on high-latency or lossy links.",
   {
     session_id: z.string().describe("Identifier of the session to use"),
     remote_path: z.string().describe("Absolute path of the remote file to download"),
@@ -569,6 +807,22 @@ server.tool(
       throw new McpError(ErrorCode.InvalidParams, `Invalid local path: ${local_path}`);
     }
     const result = await session.downloadFile(remote_path, expandedLocal);
+    return { content: [{ type: 'text', text: result }] };
+  }
+);
+
+server.tool(
+  "install-fast-channel",
+  "One-time setup of the high-speed file transfer channel on this host: installs a small Python helper (~/.agent-ssh-mcp/fastd.py, requires python3, works on mainstream Linux distros). Once installed, upload-file/download-file detect it automatically on every future session and transfer via parallel HTTP instead of SFTP — typically 10-50x faster on high-latency or lossy links (SFTP remains the automatic fallback). Call this once per host before transferring large files.",
+  {
+    session_id: z.string().describe("Identifier of the session to install the helper on"),
+  },
+  async ({ session_id }) => {
+    const session = activeSessions.get(session_id);
+    if (!session) {
+      throw new McpError(ErrorCode.InvalidParams, `Session '${session_id}' does not exist`);
+    }
+    const result = await session.installFastChannel();
     return { content: [{ type: 'text', text: result }] };
   }
 );
@@ -736,6 +990,8 @@ class PersistentSession {
   // across the exec call boundary so the next exec sends raw input instead of a wrapped command.
   private tmuxPendingMarkers: { startMarker: string; endMarker: string; lastSnapshot: string } | null = null;
   private tmuxWaitingForInput = false;
+  private fastd: FastdState = { status: 'unchecked' };
+  private fastdProbe: Promise<FastdState | null> | null = null;
 
   constructor(
     private readonly id: string,
@@ -875,6 +1131,16 @@ class PersistentSession {
         ...this.config,
         keepaliveInterval: 30000,
         keepaliveCountMax: 5,
+        // Prefer SSH compression: during negotiation the server picks the
+        // first client-offered algorithm it supports, so listing zlib first
+        // enables compression on every server that allows it (OpenSSH default
+        // is `Compression delayed`). Servers without support fall back to
+        // 'none' automatically. Speeds up SFTP fallback transfers and exec
+        // output on bandwidth-limited links.
+        algorithms: {
+          ...this.config.algorithms,
+          compress: ['zlib@openssh.com', 'zlib', 'none'],
+        },
       };
       if (proxySocket) keepaliveConfig.sock = proxySocket;
       conn.connect(keepaliveConfig);
@@ -1032,7 +1298,7 @@ class PersistentSession {
   async uploadFile(localPath: string, remotePath: string): Promise<string> {
     await this.ensureConnected();
     const sftp = await this.getSftp();
-    // Ensure remote directory exists
+    // Ensure remote directory exists (needed by both the fast channel and SFTP)
     const remoteDir = remotePath.includes('/') ? remotePath.substring(0, remotePath.lastIndexOf('/')) : '';
     if (remoteDir) {
       await new Promise<void>((resolve, reject) => {
@@ -1043,13 +1309,37 @@ class PersistentSession {
         });
       });
     }
+    // High-speed channel: parallel HTTP via the fastd helper, when installed
+    let fileSize = -1;
+    try { fileSize = (await stat(localPath)).size; } catch { /* fall through to SFTP errors */ }
+    if (fileSize >= FAST_MIN_BYTES) {
+      const fastd = await this.ensureFastChannel();
+      if (fastd) {
+        try {
+          const { bytes, ms } = await this.fastUpload(localPath, remotePath);
+          const mbps = (bytes / 1048576 / (ms / 1000)).toFixed(2);
+          return `Uploaded ${localPath} -> ${remotePath} (fast channel, ${mbps} MB/s)`;
+        } catch (err: any) {
+          console.error(`fast channel upload failed, falling back to SFTP: ${err?.message ?? err}`);
+          this.fastd = { status: 'failed' };
+        }
+      } else if (this.fastd.status === 'no-helper') {
+        // Transfer via SFTP, but nudge the agent towards the fast channel
+        const result = await this.sftpFastPut(sftp, localPath, remotePath);
+        return `${result} (SFTP fallback — run install-fast-channel on this host to enable much faster transfers)`;
+      }
+    }
+    return this.sftpFastPut(sftp, localPath, remotePath);
+  }
+
+  private async sftpFastPut(sftp: SFTPWrapper, localPath: string, remotePath: string): Promise<string> {
+    // Pipelined SFTP: keeps ~64x32KB in flight. Still far faster than the old
+    // stream pipe (one write per RTT) on high-latency links.
     return new Promise((resolve, reject) => {
-      const readStream = createReadStream(localPath);
-      const writeStream = sftp.createWriteStream(remotePath);
-      writeStream.on('error', reject);
-      readStream.on('error', reject);
-      writeStream.on('close', () => resolve(`Uploaded ${localPath} -> ${remotePath}`));
-      readStream.pipe(writeStream);
+      sftp.fastPut(localPath, remotePath, { concurrency: 64, chunkSize: 131072 }, (err) => {
+        if (err) { reject(err); return; }
+        resolve(`Uploaded ${localPath} -> ${remotePath}`);
+      });
     });
   }
 
@@ -1059,14 +1349,300 @@ class PersistentSession {
     // Ensure local directory exists
     const localDir = dirname(localPath);
     mkdirSync(localDir, { recursive: true });
+    // High-speed channel: parallel HTTP via the fastd helper, when installed.
+    // Probe remote size first so small files skip the helper handshake entirely.
+    let remoteSize = -1;
+    try {
+      const s = await new Promise<any>((resolve, reject) =>
+        sftp.stat(remotePath, (err: any, s: any) => err ? reject(err) : resolve(s))
+      );
+      remoteSize = s?.size ?? -1;
+    } catch (err: any) {
+      throw new McpError(ErrorCode.InternalError, `Cannot stat ${remotePath}: ${err?.message ?? err}`);
+    }
+    if (remoteSize >= FAST_MIN_BYTES) {
+      const fastd = await this.ensureFastChannel();
+      if (fastd) {
+        try {
+          const { bytes, ms } = await this.fastDownload(remotePath, localPath);
+          const mbps = (bytes / 1048576 / (ms / 1000)).toFixed(2);
+          return `Downloaded ${remotePath} -> ${localPath} (fast channel, ${mbps} MB/s)`;
+        } catch (err: any) {
+          console.error(`fast channel download failed, falling back to SFTP: ${err?.message ?? err}`);
+          this.fastd = { status: 'failed' };
+        }
+      } else if (this.fastd.status === 'no-helper') {
+        const result = await this.sftpFastGet(sftp, remotePath, localPath);
+        return `${result} (SFTP fallback — run install-fast-channel on this host to enable much faster transfers)`;
+      }
+    }
+    return this.sftpFastGet(sftp, remotePath, localPath);
+  }
+
+  private async sftpFastGet(sftp: SFTPWrapper, remotePath: string, localPath: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      const readStream = sftp.createReadStream(remotePath);
-      const writeStream = createWriteStream(localPath);
-      readStream.on('error', reject);
-      writeStream.on('error', reject);
-      writeStream.on('close', () => resolve(`Downloaded ${remotePath} -> ${localPath}`));
-      readStream.pipe(writeStream);
+      sftp.fastGet(remotePath, localPath, { concurrency: 64, chunkSize: 131072 }, (err) => {
+        if (err) { reject(err); return; }
+        resolve(`Downloaded ${remotePath} -> ${localPath}`);
+      });
     });
+  }
+
+  // ── Fast channel: parallel HTTP transfers via the fastd helper ──────────
+
+  private async getRemoteHome(): Promise<string> {
+    const { output } = await this.executeDirect('echo $HOME');
+    const lines = output.split('\n').map((s) => s.trim()).filter(Boolean);
+    return lines[lines.length - 1] || '/root';
+  }
+
+  private ensureFastChannel(): Promise<FastdState | null> {
+    if (process.env.SSH_MCP_DISABLE_FAST_CHANNEL === '1') {
+      return Promise.resolve(null);
+    }
+    if (this.fastd.status === 'ready') {
+      return Promise.resolve(this.fastd);
+    }
+    if (this.fastd.status !== 'unchecked') {
+      return Promise.resolve(null);
+    }
+    if (!this.fastdProbe) {
+      this.fastdProbe = this.probeAndStartFastd().finally(() => {
+        this.fastdProbe = null;
+      });
+    }
+    return this.fastdProbe;
+  }
+
+  private async probeAndStartFastd(): Promise<FastdState | null> {
+    try {
+      const { output } = await this.executeDirect(
+        // The shell may echo the typed command back, so the success/failure
+        // marker is computed at runtime ($((100+1))) — its literal text never
+        // appears in the command itself, making the match echo-proof.
+        'command -v python3 >/dev/null 2>&1 && test -f "$HOME/.agent-ssh-mcp/fastd.py" && echo "FASTD_$((100+1))YES" || echo "FASTD_$((100+2))NO"'
+      );
+      if (!output.includes('FASTD_101YES')) {
+        this.fastd = { status: 'no-helper' };
+        return null;
+      }
+      this.fastd = await this.startFastd();
+      return this.fastd.status === 'ready' ? this.fastd : null;
+    } catch (err: any) {
+      if (err?.message?.includes('still running')) {
+        return null; // shell busy with another command — retry on next transfer
+      }
+      console.error(`fast channel setup failed for session ${this.id}, using SFTP: ${err?.message ?? err}`);
+      this.fastd = { status: 'failed' };
+      return null;
+    }
+  }
+
+  private async startFastd(): Promise<FastdState> {
+    const home = await this.getRemoteHome();
+    const remoteDir = `${home}/.agent-ssh-mcp`;
+    const token = randomUUID().replace(/-/g, '');
+    // Start the helper detached; it picks a free port itself and writes it to
+    // the port file once listening. pkill clears any stale helper first.
+    const { output } = await this.executeDirect(
+      `pkill -f 'agent-ssh-mcp/fastd.py' 2>/dev/null; rm -f "${remoteDir}/fastd.port"; ` +
+      `OGOC_FASTD_TOKEN=${token} nohup python3 "${remoteDir}/fastd.py" --port 0 --port-file "${remoteDir}/fastd.port" --idle 1800 >/dev/null 2>&1 & echo FASTD_PID=$!`
+    );
+    const pidMatch = output.match(/FASTD_PID=(\d+)/);
+    const pid = pidMatch ? parseInt(pidMatch[1], 10) : null;
+    const sftp = await this.getSftp();
+    let port = 0;
+    for (let i = 0; i < 10 && !port; i++) {
+      await sleep(250);
+      try {
+        const data: Buffer = await new Promise((resolve, reject) => {
+          sftp.readFile(`${remoteDir}/fastd.port`, (err: any, buf: Buffer) => (err ? reject(err) : resolve(buf)));
+        });
+        port = parseInt(data.toString().trim(), 10) || 0;
+      } catch { /* port file not written yet */ }
+    }
+    if (!port) {
+      console.error(`fast channel helper did not report a port on session ${this.id}, using SFTP`);
+      return { status: 'unreachable' };
+    }
+
+    // Opportunistic direct connection (LAN / unfiltered routes): the helper
+    // binds an ephemeral token-gated port; try reaching it directly first so
+    // transfers can use multiple independent TCP streams. No ports need to be
+    // pre-opened by the user — if the direct route is blocked (firewall,
+    // filtered transit), fall back to tunneling through the SSH connection.
+    const host = this.config.host!;
+    try {
+      const res = await fetch(`http://${host}:${port}/stat?path=${encodeURIComponent('/etc/hostname')}`, {
+        headers: { 'X-Fastd-Token': token },
+        signal: abortAfter(4000),
+      });
+      if (res.ok) {
+        console.error(`fast channel ready (direct): ${host}:${port}`);
+        return { status: 'ready', mode: 'direct', baseUrl: `http://${host}:${port}`, token, pid, remoteDir };
+      }
+    } catch { /* direct route blocked — tunnel instead */ }
+
+    // Tunnel fallback: reuse the SSH connection (no extra open ports). Each
+    // HTTP connection is forwarded as its own channel, so parallel chunk
+    // requests still get independent channel windows.
+    const localServer = net.createServer((sock) => {
+      this.conn?.forwardOut('127.0.0.1', sock.remotePort ?? 0, '127.0.0.1', port, (err, channel) => {
+        if (err) { sock.destroy(); return; }
+        sock.pipe(channel).pipe(sock);
+        sock.on('error', () => channel.end());
+        channel.on('error', () => sock.destroy());
+      });
+    });
+    const localPort = await new Promise<number>((resolve, reject) => {
+      localServer.once('error', reject);
+      localServer.listen(0, '127.0.0.1', () => {
+        const addr = localServer.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    if (!localPort) {
+      localServer.close();
+      return { status: 'failed' };
+    }
+    // Sanity check through the tunnel
+    try {
+      const res = await fetch(`http://127.0.0.1:${localPort}/stat?path=${encodeURIComponent('/etc/hostname')}`, {
+        headers: { 'X-Fastd-Token': token },
+        signal: abortAfter(15000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err: any) {
+      localServer.close();
+      console.error(`fast channel tunnel check failed on session ${this.id} (${err?.message ?? err}), using SFTP`);
+      return { status: 'unreachable' };
+    }
+    console.error(`fast channel ready (tunnel via SSH): 127.0.0.1:${localPort} -> helper port ${port}`);
+    return { status: 'ready', mode: 'tunnel', baseUrl: `http://127.0.0.1:${localPort}`, token, localServer, pid, remoteDir };
+  }
+
+  private async fastUpload(localPath: string, remotePath: string): Promise<{ bytes: number; ms: number }> {
+    const st = this.fastd;
+    if (st.status !== 'ready') throw new Error('fast channel not ready');
+    const enc = encodeURIComponent;
+    const headers = { 'X-Fastd-Token': st.token };
+    const size = (await stat(localPath)).size;
+    const t0 = Date.now();
+    let res = await fetch(`${st.baseUrl}/truncate?path=${enc(remotePath)}&size=${size}`, {
+      method: 'POST', headers, signal: abortAfter(30000),
+    });
+    if (!res.ok) throw new Error(`fastd truncate failed: HTTP ${res.status}`);
+    const chunkCount = size === 0 ? 0 : Math.ceil(size / FAST_CHUNK);
+    let nextChunk = 0;
+    const fd = await openFileHandle(localPath, 'r');
+    try {
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const i = nextChunk++;
+          if (i >= chunkCount) return;
+          const start = i * FAST_CHUNK;
+          const len = Math.min(FAST_CHUNK, size - start);
+          const buf = Buffer.alloc(len);
+          const { bytesRead } = await fd.read(buf, 0, len, start);
+          if (bytesRead !== len) throw new Error(`short local read at offset ${start}`);
+          const r = await fetch(`${st.baseUrl}/write?path=${enc(remotePath)}&offset=${start}`, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/octet-stream' },
+            body: buf,
+            signal: abortAfter(300000),
+          });
+          if (!r.ok) throw new Error(`fastd write failed: HTTP ${r.status}`);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(FAST_CONCURRENCY, chunkCount) }, worker));
+    } finally {
+      await fd.close();
+    }
+    res = await fetch(`${st.baseUrl}/stat?path=${enc(remotePath)}`, { headers, signal: abortAfter(30000) });
+    if (!res.ok) throw new Error(`fastd stat failed: HTTP ${res.status}`);
+    const info = await res.json() as { size: number };
+    if (info.size !== size) throw new Error(`fastd upload size mismatch: remote ${info.size} != local ${size}`);
+    return { bytes: size, ms: Date.now() - t0 };
+  }
+
+  private async fastDownload(remotePath: string, localPath: string): Promise<{ bytes: number; ms: number }> {
+    const st = this.fastd;
+    if (st.status !== 'ready') throw new Error('fast channel not ready');
+    const enc = encodeURIComponent;
+    const headers = { 'X-Fastd-Token': st.token };
+    const t0 = Date.now();
+    const res = await fetch(`${st.baseUrl}/stat?path=${enc(remotePath)}`, { headers, signal: abortAfter(30000) });
+    if (!res.ok) throw new Error(`fastd stat failed: HTTP ${res.status}`);
+    const info = await res.json() as { size: number; isdir?: boolean };
+    if (info.isdir) throw new Error('fast channel cannot download directories');
+    const size = info.size;
+    mkdirSync(dirname(localPath), { recursive: true });
+    const fd = await openFileHandle(localPath, 'w');
+    await fd.truncate(size);
+    await fd.close();
+    const chunkCount = size === 0 ? 0 : Math.ceil(size / FAST_CHUNK);
+    let nextChunk = 0;
+    const wfd = await openFileHandle(localPath, 'r+');
+    try {
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const i = nextChunk++;
+          if (i >= chunkCount) return;
+          const start = i * FAST_CHUNK;
+          const end = Math.min(start + FAST_CHUNK, size) - 1;
+          const r = await fetch(`${st.baseUrl}/read?path=${enc(remotePath)}`, {
+            headers: { ...headers, Range: `bytes=${start}-${end}` },
+            signal: abortAfter(300000),
+          });
+          if (!r.ok && r.status !== 206) throw new Error(`fastd read failed: HTTP ${r.status}`);
+          const ab = await r.arrayBuffer();
+          if (ab.byteLength !== end - start + 1) {
+            throw new Error(`fastd short read at offset ${start}: got ${ab.byteLength}, want ${end - start + 1}`);
+          }
+          await wfd.write(Buffer.from(ab), 0, ab.byteLength, start);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(FAST_CONCURRENCY, chunkCount) }, worker));
+    } finally {
+      await wfd.close();
+    }
+    return { bytes: size, ms: Date.now() - t0 };
+  }
+
+  async installFastChannel(): Promise<string> {
+    await this.ensureConnected();
+    const sftp = await this.getSftp();
+    const home = await this.getRemoteHome();
+    const dir = `${home}/.agent-ssh-mcp`;
+    await new Promise<void>((resolve, reject) => {
+      sftp.mkdir(dir, (err: any) => (err && err.code !== 4 && err.code !== 2 ? reject(err) : resolve()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      sftp.writeFile(`${dir}/fastd.py`, FASTD_SCRIPT, (err: any) => (err ? reject(err) : resolve()));
+    });
+    // Same echo-proof marker trick as probeAndStartFastd
+    const py = await this.executeDirect('command -v python3 >/dev/null 2>&1 && python3 -V 2>&1 || echo "__NO_$((100+3))PYTHON3"');
+    if (py.output.includes('__NO_103PYTHON3')) {
+      return `Helper script installed at ${dir}/fastd.py, but python3 is not available on this host. ` +
+        'Install it with the distro package manager (apt install python3 / dnf install python3 / apk add python3 / pacman -S python) ' +
+        'and call install-fast-channel again. Transfers will use SFTP until then.';
+    }
+    const chk = await this.executeDirect(`python3 -m py_compile "${dir}/fastd.py" && echo "SYNTAX_$((200+1))OK"`);
+    if (!chk.output.includes('SYNTAX_201OK')) {
+      throw new McpError(ErrorCode.InternalError, `fastd.py failed syntax check: ${chk.output}`);
+    }
+    this.fastd = { status: 'unchecked' }; // re-probe on the next transfer
+    return `Fast channel helper installed at ${dir}/fastd.py (${py.output.trim()}). ` +
+      'It is detected automatically on upload-file/download-file and started on demand; transfers fall back to SFTP if unreachable. ' +
+      'Security note: while running, the helper binds 0.0.0.0 on an ephemeral port gated by a per-session random token and exits after 30 minutes idle.';
+  }
+
+  private stopFastd(): void {
+    const st = this.fastd;
+    if (st.status !== 'ready' || !st.pid || !this.conn) return;
+    try {
+      this.conn.exec(`kill ${st.pid} 2>/dev/null; rm -f "${st.remoteDir}/fastd.port"`, () => {});
+    } catch { /* connection may already be gone */ }
   }
 
   async writeRemoteFile(remotePath: string, content: string): Promise<string> {
@@ -1301,6 +1877,7 @@ class PersistentSession {
       return;
     }
     this.disposed = true;
+    this.stopFastd();
     this.cleanup();
   }
 
@@ -1376,6 +1953,11 @@ class PersistentSession {
       this.sftp.end();
       this.sftp = null;
     }
+
+    if (this.fastd.status === 'ready' && this.fastd.localServer) {
+      this.fastd.localServer.close();
+    }
+    this.fastd = { status: 'unchecked' };
 
     if (this.conn) {
       this.conn.removeAllListeners();
